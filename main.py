@@ -18,30 +18,15 @@ Usage: run from a git repository root:
                                                   <output.csv>
 
 Notes:
-- The script writes CSV output to the required positional <output.csv> file.
-- Use --from-date (alias --since) and --to-date (alias --until) to limit the commit range.
-  These values are passed to `git log` and accept any date formats that Git understands
-  (e.g. "2023-01-01", "2 weeks ago", "2023-01-01 12:00"). The script validates the
-  date strings by asking `git` to parse them. If parsing fails the script exits with an error.
-- Use --branch to restrict analysis to a single branch/ref (e.g. `main` or `origin/main`). If
-  not provided the script uses `--all` to include all refs.
-- Grouping is now case-insensitive (uses Unicode-aware casefolding). When grouping by email,
-  the `author` column will contain a semicolon-separated list of original author names seen for
-  that email. When grouping by name, the `email` column contains a semicolon-separated list of
-  emails seen for that name.
-- Logging uses the standard `logging` module and goes to stderr so the CSV file/stdout
-  stays clean.
-- `--verbose` enables DEBUG logs (detailed per-commit and flush info).
-- `--progress N` prints INFO-level progress messages every N commits.
-- `--log-level` explicitly sets the logging level and overrides `--verbose` / `--progress`.
-
-Common examples:
-    python3 git_author_char_stats_with_logging.py --group-by name --from-date "2024-01-01" --to-date "2024-12-31" out.csv
-    python3 git_author_char_stats_with_logging.py --since "2 months ago" --branch main --progress 200 --verbose stats.csv
-
+- Grouping is case-insensitive using Unicode-aware casefold().
+- When grouping by email, the `author` column lists all author names seen for that email
+  (semicolon-separated) and the `email` column shows a canonical email (most frequent first seen).
+- When grouping by name, the `author` column shows a canonical name form and the `email`
+  column lists all emails seen for that name.
+- The script validates dates and branch/ref before running and logs progress to stderr.
 """
 
-from collections import defaultdict
+from collections import defaultdict, Counter
 import subprocess
 import sys
 import csv
@@ -49,6 +34,7 @@ import argparse
 import logging
 
 # ------------------ Utility functions ------------------
+
 
 def run(cmd):
     """Run command and return stdout as text. Raises RuntimeError on non-zero exit."""
@@ -59,6 +45,18 @@ def run(cmd):
     return out
 
 
+def check_git_repo():
+    """Validate if current folder is a git repository."""
+    cmd = ["git", "status"]
+    try:
+        result = run(cmd)
+        logging.debug(f"git status: {result}")
+        return True
+    except RuntimeError as err:
+        logging.error(f"Folder is not a git repository:\n{err}")
+        return False
+
+
 def check_git_date(date_str, refspec=None):
     """Validate that git accepts a date string by running a trivial git log query.
 
@@ -67,13 +65,16 @@ def check_git_date(date_str, refspec=None):
     validation uses the same refs that will be used during processing.
     """
     cmd = ["git", "log", "--pretty=format:%H", f"--since={date_str}", "-n", "1"]
+    logging.debug(f"Check date using the command'{cmd}'")
     if refspec:
         cmd.append(refspec)
     try:
         # if git accepts the date but there are no commits in range, git returns 0 and empty output
-        _ = run(cmd)
+        result = run(cmd)
+        logging.debug(f"git date check result: {result}")
         return True
-    except RuntimeError:
+    except RuntimeError as err:
+        logging.debug(f"git date check error: {err}")
         return False
 
 
@@ -139,27 +140,70 @@ def levenshtein(a: str, b: str) -> int:
 
 # ------------------ Argument parsing ------------------
 
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Per-author git stats including character-level changes (logging)")
-    ap.add_argument("--include-merges", action="store_true", help="Include merge commits")
-    ap.add_argument("--group-by", choices=("name", "email"), default="name", help="Group authors by name or email")
-    ap.add_argument("--limit", type=int, default=0, help="Limit to most recent N commits (0 = all)")
-    ap.add_argument("--progress", type=int, default=0, help="Print a progress message every N commits (0 = disabled)")
-    ap.add_argument("--verbose", action="store_true", help="Verbose debug output (sets log level to DEBUG)")
-    ap.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                    help="Explicit log level (overrides --verbose and --progress default behavior)")
+    ap = argparse.ArgumentParser(
+        description="Per-author git stats including character-level changes (logging)"
+    )
+    ap.add_argument(
+        "--include-merges", action="store_true", help="Include merge commits"
+    )
+    ap.add_argument(
+        "--group-by",
+        "-G",
+        choices=("name", "email"),
+        default="name",
+        help="Group authors by name or email",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=0, help="Limit to most recent N commits (0 = all)"
+    )
+    ap.add_argument(
+        "--progress",
+        "-P",
+        type=int,
+        default=0,
+        help="Print a progress message every N commits (0 = disabled)",
+    )
+    ap.add_argument(
+        "--verbose",
+        "-V",
+        action="store_true",
+        help="Verbose debug output (sets log level to DEBUG)",
+    )
+    ap.add_argument(
+        "--log-level",
+        "-L",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Explicit log level (overrides --verbose and --progress default behavior)",
+    )
     # date range options: aliases map to git's --since / --until
-    ap.add_argument("--from-date", "--since", dest="since", default=None,
-                    help="Start date (inclusive). Passed to `git log --since`. Accepts git date formats.")
-    ap.add_argument("--to-date", "--until", dest="until", default=None,
-                    help="End date (inclusive). Passed to `git log --until`. Accepts git date formats.")
-    ap.add_argument("--branch", dest="branch", default=None,
-                    help="Optional branch or ref to analyze (e.g. 'main' or 'origin/main'). If omitted, --all is used.")
+    ap.add_argument(
+        "--from-date",
+        "--since",
+        dest="since",
+        default=None,
+        help="Start date (inclusive). Passed to `git log --since`. Accepts git date formats.",
+    )
+    ap.add_argument(
+        "--to-date",
+        "--until",
+        dest="until",
+        default=None,
+        help="End date (inclusive). Passed to `git log --until`. Accepts git date formats.",
+    )
+    ap.add_argument(
+        "--branch",
+        dest="branch",
+        default=None,
+        help="Optional branch or ref to analyze (e.g. 'main' or 'origin/main'). If omitted, --all is used.",
+    )
     ap.add_argument("output", help="Output CSV file path (required)")
     return ap.parse_args()
 
 
 # ------------------ Main ------------------
+
 
 def main():
     args = parse_args()
@@ -184,10 +228,15 @@ def main():
         level = logging.WARNING
 
     # Ensure logs go to stderr to keep CSV file clean
-    logging.basicConfig(stream=sys.stderr, level=level, format='[%(levelname)s] %(message)s')
+    logging.basicConfig(
+        stream=sys.stderr, level=level, format="[%(levelname)s] %(message)s"
+    )
     logger = logging.getLogger(__name__)
 
-    logger.debug("Starting git_author_char_stats_with_logging.py")
+    logger.debug("Starting to collect git statistics")
+
+    if not check_git_repo():
+        sys.exit(1)
 
     # Validate branch if provided
     if branch:
@@ -258,19 +307,46 @@ def main():
     deleted_lines = defaultdict(int)
     commits_count = defaultdict(int)
 
-    added_chars = defaultdict(int)     # pure added line characters (surplus additions)
-    deleted_chars = defaultdict(int)   # pure deleted line characters (surplus deletions)
-    modified_chars = defaultdict(int)  # Levenshtein distance summed for paired del+add lines
+    added_chars = defaultdict(int)  # pure added line characters (surplus additions)
+    deleted_chars = defaultdict(int)  # pure deleted line characters (surplus deletions)
+    modified_chars = defaultdict(
+        int
+    )  # Levenshtein distance summed for paired del+add lines
 
-    emails_by_author = defaultdict(set)  # maps grouping key -> set of emails seen
+    # For canonicalization and display
+    # When grouping by email: map norm_email -> set(names), and count email variants
+    author_names_by_email = defaultdict(Counter)
+    canonical_email = {}  # norm_email -> canonical email string (most common seen)
+
+    # When grouping by name: map norm_name -> set(emails), and count name variants
+    emails_by_name = defaultdict(Counter)
+    canonical_name = {}
 
     # Process each commit
     for i, (chash, aname, aemail) in enumerate(commits, start=1):
-        key = aname if group_by == "name" else aemail
-        commits_count[key] += 1
-        emails_by_author[key].add(aemail)
+        norm_name = aname.casefold()
+        norm_email = aemail.casefold()
 
-        logger.debug("Processing commit %s (author=%r email=%r) [%d/%d]", chash, aname, aemail, i, total_commits)
+        if group_by == "name":
+            key = norm_name
+            # record canonical (first-seen / or most common) name and emails
+            canonical_name.setdefault(key, aname)
+            emails_by_name[key][aemail] += 1
+        else:  # group_by == "email"
+            key = norm_email
+            canonical_email.setdefault(key, aemail)
+            author_names_by_email[key][aname] += 1
+
+        commits_count[key] += 1
+
+        logger.debug(
+            "Processing commit %s (author=%r email=%r) [%d/%d]",
+            chash,
+            aname,
+            aemail,
+            i,
+            total_commits,
+        )
 
         # Get patch for this commit. use --unified=0 to reduce context lines
         try:
@@ -316,14 +392,25 @@ def main():
             if len(del_buffer) > pairs:
                 for line in del_buffer[pairs:]:
                     deleted_chars[local_key] += len(line)
-            logger.debug("flush for %r: pairs=%d, paired_modified_sum=%d, surplus_added=%d, surplus_deleted=%d",
-                         local_key, pairs, paired_modified_total, max(0, len(add_buffer)-pairs), max(0, len(del_buffer)-pairs))
+            logger.debug(
+                "flush for %r: pairs=%d, paired_modified_sum=%d, surplus_added=%d, surplus_deleted=%d",
+                local_key,
+                pairs,
+                paired_modified_total,
+                max(0, len(add_buffer) - pairs),
+                max(0, len(del_buffer) - pairs),
+            )
             del_buffer = []
             add_buffer = []
 
         # Walk patch line by line
         for raw in patch.splitlines():
-            if raw.startswith("diff ") or raw.startswith("index ") or raw.startswith("--- ") or raw.startswith("+++ "):
+            if (
+                raw.startswith("diff ")
+                or raw.startswith("index ")
+                or raw.startswith("--- ")
+                or raw.startswith("+++ ")
+            ):
                 # file header lines - flush any buffered hunk changes
                 if del_buffer or add_buffer:
                     flush_buffers(key)
@@ -346,13 +433,13 @@ def main():
             first = raw[0]
             if first == "-":
                 line_content = raw[1:]
-                if line_content.startswith("\ No newline"):
+                if line_content.startswith("\\ No newline"):
                     continue
                 deleted_lines[key] += 1
                 del_buffer.append(line_content)
             elif first == "+":
                 line_content = raw[1:]
-                if line_content.startswith("\ No newline"):
+                if line_content.startswith("\\ No newline"):
                     continue
                 added_lines[key] += 1
                 add_buffer.append(line_content)
@@ -371,13 +458,22 @@ def main():
 
     # Prepare output CSV and write to file
     fieldnames = [
-        "author", "email", "commits",
-        "added_lines", "deleted_lines", "added+deleted_lines", "net_lines",
-        "added_chars", "deleted_chars", "modified_chars", "added_or_modified_chars", "net_chars"
+        "author",
+        "email",
+        "commits",
+        "added_lines",
+        "deleted_lines",
+        "added+deleted_lines",
+        "net_lines",
+        "added_chars",
+        "deleted_chars",
+        "modified_chars",
+        "added_or_modified_chars",
+        "net_chars",
     ]
 
     try:
-        outf = open(output_path, 'w', newline='', encoding='utf-8')
+        outf = open(output_path, "w", newline="", encoding="utf-8")
     except Exception as e:
         logger.error("Failed to open output file %s: %s", output_path, e)
         sys.exit(1)
@@ -385,42 +481,68 @@ def main():
     writer = csv.writer(outf, quoting=csv.QUOTE_STRINGS)
     writer.writerow(fieldnames)
 
-    authors = set(list(commits_count.keys()) +
-                  list(added_lines.keys()) +
-                  list(added_chars.keys()) +
-                  list(modified_chars.keys()))
+    authors = set(
+        list(commits_count.keys())
+        + list(added_lines.keys())
+        + list(added_chars.keys())
+        + list(modified_chars.keys())
+    )
 
     def sort_key(a):
-        return (modified_chars.get(a, 0) + added_chars.get(a, 0))
+        return modified_chars.get(a, 0) + added_chars.get(a, 0)
 
-    for author in sorted(authors, key=sort_key, reverse=True):
-        # If grouping by email, the author key *is* the email; show it directly.
-        if group_by == 'email':
-            email_field = author
+    for key in sorted(authors, key=sort_key, reverse=True):
+        if group_by == "email":
+            # email grouping: author column = list of names seen; email column = canonical email
+            names_counter = author_names_by_email.get(key, Counter())
+            # canonical email: prefer most common original email (we stored canonical_email as first seen)
+            email_field = canonical_email.get(key, key)
+            # produce a stable ordering: most common names first
+            author_list = [name for name, _ in names_counter.most_common()]
+            author_field = ";".join(author_list)
         else:
-            email_list = sorted(emails_by_author.get(author, []))
+            # name grouping: author column = canonical name, email column = list of emails seen
+            author_field = canonical_name.get(key, key)
+            emails_counter = emails_by_name.get(key, Counter())
+            email_list = [email for email, _ in emails_counter.most_common()]
             email_field = ";".join(email_list)
 
-        added_l = added_lines.get(author, 0)
-        deleted_l = deleted_lines.get(author, 0)
+        added_l = added_lines.get(key, 0)
+        deleted_l = deleted_lines.get(key, 0)
         added_plus_deleted_l = added_l + deleted_l
         net_l = added_l - deleted_l
 
-        a_chars = added_chars.get(author, 0)
-        d_chars = deleted_chars.get(author, 0)
-        m_chars = modified_chars.get(author, 0)
+        a_chars = added_chars.get(key, 0)
+        d_chars = deleted_chars.get(key, 0)
+        m_chars = modified_chars.get(key, 0)
         added_or_modified = m_chars + a_chars
         net_chars = a_chars - d_chars
 
-        writer.writerow([
-            author, email_field, commits_count.get(author, 0),
-            added_l, deleted_l, added_plus_deleted_l, net_l,
-            a_chars, d_chars, m_chars, added_or_modified, net_chars
-        ])
+        writer.writerow(
+            [
+                author_field,
+                email_field,
+                commits_count.get(key, 0),
+                added_l,
+                deleted_l,
+                added_plus_deleted_l,
+                net_l,
+                a_chars,
+                d_chars,
+                m_chars,
+                added_or_modified,
+                net_chars,
+            ]
+        )
 
     outf.close()
 
-    logger.info("Finished processing %d commits; authors=%d; wrote %s", total_commits, len(authors), output_path)
+    logger.info(
+        "Finished processing %d commits; authors=%d; wrote %s",
+        total_commits,
+        len(authors),
+        output_path,
+    )
 
     # Totals (logged at INFO level)
     tot_added_l = sum(added_lines.values())
@@ -428,8 +550,14 @@ def main():
     tot_added_chars = sum(added_chars.values())
     tot_deleted_chars = sum(deleted_chars.values())
     tot_modified_chars = sum(modified_chars.values())
-    logger.info("Totals: added_lines=%d, deleted_lines=%d, added_chars=%d, deleted_chars=%d, modified_chars=%d",
-                tot_added_l, tot_deleted_l, tot_added_chars, tot_deleted_chars, tot_modified_chars)
+    logger.info(
+        "Totals: added_lines=%d, deleted_lines=%d, added_chars=%d, deleted_chars=%d, modified_chars=%d",
+        tot_added_l,
+        tot_deleted_l,
+        tot_added_chars,
+        tot_deleted_chars,
+        tot_modified_chars,
+    )
 
 
 if __name__ == "__main__":

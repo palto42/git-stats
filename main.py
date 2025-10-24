@@ -205,24 +205,13 @@ def parse_args():
 # ------------------ Main ------------------
 
 
-def main():
-    args = parse_args()
-    include_merges = args.include_merges
-    group_by = args.group_by
-    limit = args.limit if args.limit and args.limit > 0 else None
-    progress_every = args.progress if args.progress and args.progress > 0 else None
-    output_path = args.output
-    since = args.since
-    until = args.until
-    branch = args.branch
-
-    # Configure logging
-    # Default: WARNING. If --verbose -> DEBUG. If progress requested -> INFO. --log-level overrides.
+def configure_logging(args):
+    """Configure and return a logger based on args."""
     if args.log_level:
         level = getattr(logging, args.log_level)
     elif args.verbose:
         level = logging.DEBUG
-    elif progress_every:
+    elif args.progress and args.progress > 0:
         level = logging.INFO
     else:
         level = logging.WARNING
@@ -231,54 +220,60 @@ def main():
     logging.basicConfig(
         stream=sys.stderr, level=level, format="[%(levelname)s] %(message)s"
     )
-    logger = logging.getLogger(__name__)
+    return logging.getLogger(__name__)
 
-    logger.debug("Starting to collect git statistics")
 
+def validate_inputs_or_exit(args, logger):
+    """Validate git repo, branch and date inputs or exit the program."""
     if not check_git_repo():
         sys.exit(1)
 
-    # Validate branch if provided
-    if branch:
-        logger.info("Validating branch/ref '%s'...", branch)
-        if not validate_branch(branch):
-            logger.error("Branch/ref '%s' not found or not resolvable by git.", branch)
+    if args.branch:
+        logger.info("Validating branch/ref '%s'...", args.branch)
+        if not validate_branch(args.branch):
+            logger.error(
+                "Branch/ref '%s' not found or not resolvable by git.", args.branch
+            )
             sys.exit(1)
-        logger.debug("Branch '%s' exists.", branch)
+        logger.debug("Branch '%s' exists.", args.branch)
 
-    # Validate date inputs (if provided) by asking git to parse them. Use the same ref selection as we'll use later.
-    refspec_for_validation = branch if branch else "--all"
-    if since:
-        logger.info("Validating --from-date/--since value: %s", since)
-        if not check_git_date(since, refspec_for_validation):
-            logger.error("Invalid or unparseable --from-date/--since: %s", since)
+    refspec_for_validation = args.branch if args.branch else "--all"
+    if args.since:
+        logger.info("Validating --from-date/--since value: %s", args.since)
+        if not check_git_date(args.since, refspec_for_validation):
+            logger.error("Invalid or unparseable --from-date/--since: %s", args.since)
             sys.exit(1)
-        logger.debug("--from-date parsed OK: %s", since)
-    if until:
-        logger.info("Validating --to-date/--until value: %s", until)
-        if not check_git_until_date(until, refspec_for_validation):
-            logger.error("Invalid or unparseable --to-date/--until: %s", until)
+        logger.debug("--from-date parsed OK: %s", args.since)
+    if args.until:
+        logger.info("Validating --to-date/--until value: %s", args.until)
+        if not check_git_until_date(args.until, refspec_for_validation):
+            logger.error("Invalid or unparseable --to-date/--until: %s", args.until)
             sys.exit(1)
-        logger.debug("--to-date parsed OK: %s", until)
+        logger.debug("--to-date parsed OK: %s", args.until)
 
-    # Prepare git log command
+
+def build_git_log_cmd(args):
+    """Return (git_cmd, sep) for the git log invocation used to list commits."""
     sep = "\x01"
     fmt = f"%H{sep}%aN{sep}%aE"
     git_cmd = ["git", "log", f"--pretty=format:{fmt}"]
-    if not include_merges:
+    if not args.include_merges:
         git_cmd.append("--no-merges")
-    if limit:
-        git_cmd.extend(["-n", str(limit)])
-    if since:
-        git_cmd.append(f"--since={since}")
-    if until:
-        git_cmd.append(f"--until={until}")
-    # Refs selection: if branch provided, analyze that ref; otherwise include --all
-    if branch:
-        git_cmd.append(branch)
+    if args.limit and args.limit > 0:
+        git_cmd.extend(["-n", str(args.limit)])
+    if args.since:
+        git_cmd.append(f"--since={args.since}")
+    if args.until:
+        git_cmd.append(f"--until={args.until}")
+    if args.branch:
+        git_cmd.append(args.branch)
     else:
         git_cmd.append("--all")
+    return git_cmd, sep
 
+
+def collect_commits(git_cmd, sep, logger):
+    """Run git log and return list of (hash, author_name, author_email)."""
     logger.info("Running git log to list commits...")
     try:
         out = run(git_cmd)
@@ -294,15 +289,16 @@ def main():
             continue
         chash, aname, aemail = parts
         commits.append((chash.strip(), aname.strip(), aemail.strip()))
+    return commits
 
-    total_commits = len(commits)
-    if total_commits == 0:
-        logger.error("No commits found.")
-        sys.exit(1)
 
-    logger.info("Found %d commits to process.", total_commits)
-
-    # Aggregation containers
+def process_commits(
+    commits,
+    group_by,
+    progress_every,
+    logger,
+):
+    """Process commits, compute per-author aggregations and return all containers."""
     added_lines = defaultdict(int)
     deleted_lines = defaultdict(int)
     commits_count = defaultdict(int)
@@ -322,7 +318,13 @@ def main():
     emails_by_name = defaultdict(Counter)
     canonical_name = {}
 
-    # Process each commit
+    total_commits = len(commits)
+    if total_commits == 0:
+        logger.error("No commits found.")
+        sys.exit(1)
+
+    logger.info("Found %d commits to process.", total_commits)
+
     for i, (chash, aname, aemail) in enumerate(commits, start=1):
         norm_name = aname.casefold()
         norm_email = aemail.casefold()
@@ -456,7 +458,23 @@ def main():
         if progress_every and i % progress_every == 0:
             logger.info("Processed %d/%d commits...", i, total_commits)
 
-    # Prepare output CSV and write to file
+    containers = {
+        "added_lines": added_lines,
+        "deleted_lines": deleted_lines,
+        "commits_count": commits_count,
+        "added_chars": added_chars,
+        "deleted_chars": deleted_chars,
+        "modified_chars": modified_chars,
+        "author_names_by_email": author_names_by_email,
+        "canonical_email": canonical_email,
+        "emails_by_name": emails_by_name,
+        "canonical_name": canonical_name,
+        "total_commits": total_commits,
+    }
+    return containers
+
+
+def write_output_csv(output_path, group_by, containers, logger):
     fieldnames = [
         "author",
         "email",
@@ -480,6 +498,17 @@ def main():
 
     writer = csv.writer(outf, quoting=csv.QUOTE_STRINGS)
     writer.writerow(fieldnames)
+
+    added_lines = containers["added_lines"]
+    deleted_lines = containers["deleted_lines"]
+    commits_count = containers["commits_count"]
+    added_chars = containers["added_chars"]
+    deleted_chars = containers["deleted_chars"]
+    modified_chars = containers["modified_chars"]
+    author_names_by_email = containers["author_names_by_email"]
+    canonical_email = containers["canonical_email"]
+    emails_by_name = containers["emails_by_name"]
+    canonical_name = containers["canonical_name"]
 
     authors = set(
         list(commits_count.keys())
@@ -537,6 +566,14 @@ def main():
 
     outf.close()
 
+
+def log_totals_and_finish(containers, total_commits, output_path, logger):
+    authors = set(
+        list(containers["commits_count"].keys())
+        + list(containers["added_lines"].keys())
+        + list(containers["added_chars"].keys())
+        + list(containers["modified_chars"].keys())
+    )
     logger.info(
         "Finished processing %d commits; authors=%d; wrote %s",
         total_commits,
@@ -544,12 +581,11 @@ def main():
         output_path,
     )
 
-    # Totals (logged at INFO level)
-    tot_added_l = sum(added_lines.values())
-    tot_deleted_l = sum(deleted_lines.values())
-    tot_added_chars = sum(added_chars.values())
-    tot_deleted_chars = sum(deleted_chars.values())
-    tot_modified_chars = sum(modified_chars.values())
+    tot_added_l = sum(containers["added_lines"].values())
+    tot_deleted_l = sum(containers["deleted_lines"].values())
+    tot_added_chars = sum(containers["added_chars"].values())
+    tot_deleted_chars = sum(containers["deleted_chars"].values())
+    tot_modified_chars = sum(containers["modified_chars"].values())
     logger.info(
         "Totals: added_lines=%d, deleted_lines=%d, added_chars=%d, deleted_chars=%d, modified_chars=%d",
         tot_added_l,
@@ -558,6 +594,30 @@ def main():
         tot_deleted_chars,
         tot_modified_chars,
     )
+
+
+def main():
+    args = parse_args()
+    progress_every = args.progress if args.progress and args.progress > 0 else None
+
+    logger = configure_logging(args)
+    logger.debug("Starting to collect git statistics")
+
+    validate_inputs_or_exit(args, logger)
+
+    git_cmd, sep = build_git_log_cmd(args)
+    commits = collect_commits(git_cmd, sep, logger)
+
+    containers = process_commits(
+        commits,
+        args.group_by,
+        progress_every,
+        logger,
+    )
+
+    write_output_csv(args.output, args.group_by, containers, logger)
+
+    log_totals_and_finish(containers, containers["total_commits"], args.output, logger)
 
 
 if __name__ == "__main__":
